@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -35,8 +34,7 @@ func (command *ExecuteCommand) Execute(args []string) error {
 	connection, err := rc.TargetConnection(Fly.Target)
 
 	if err != nil {
-		log.Fatalln(err)
-		return nil
+		return err
 	}
 
 	client := concourse.NewClient(connection)
@@ -87,12 +85,18 @@ func (command *ExecuteCommand) Execute(args []string) error {
 
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM)
 
+	inputChan := make(chan error)
 	go func() {
 		for _, i := range inputs {
 			if i.Path != "" {
-				upload(i, excludeIgnored, atcRequester)
+				err := upload(i, excludeIgnored, atcRequester)
+				if err != nil {
+					inputChan <- err
+					break
+				}
 			}
 		}
+		close(inputChan)
 	}()
 
 	var outputChans []chan (interface{})
@@ -112,12 +116,16 @@ func (command *ExecuteCommand) Execute(args []string) error {
 	eventSource, err := client.BuildEvents(fmt.Sprintf("%d", build.ID))
 
 	if err != nil {
-		log.Println("failed to attach to stream:", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to attach to stream: %s", err.Error())
 	}
 
 	exitCode := eventstream.Render(os.Stdout, eventSource)
 	eventSource.Close()
+
+	err = <-inputChan
+	if err != nil {
+		return err
+	}
 
 	if len(outputs) > 0 {
 		for _, outputChan := range outputChans {
@@ -465,7 +473,7 @@ func abortOnSignal(
 	os.Exit(2)
 }
 
-func upload(input Input, excludeIgnored bool, atcRequester *atcRequester) {
+func upload(input Input, excludeIgnored bool, atcRequester *atcRequester) error {
 	path := input.Path
 	pipe := input.Pipe
 
@@ -475,8 +483,7 @@ func upload(input Input, excludeIgnored bool, atcRequester *atcRequester) {
 	if excludeIgnored {
 		files, err = getGitFiles(path)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "could not determine ignored files:", err)
-			return
+			return fmt.Errorf("could not determine ignored files: %s", err.Error())
 		}
 	} else {
 		files = []string{"."}
@@ -484,8 +491,7 @@ func upload(input Input, excludeIgnored bool, atcRequester *atcRequester) {
 
 	archive, err := tarStreamFrom(path, files)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "could create tar stream:", err)
-		return
+		return fmt.Errorf("could not create tar stream: %s", err.Error())
 	}
 
 	defer archive.Close()
@@ -501,14 +507,16 @@ func upload(input Input, excludeIgnored bool, atcRequester *atcRequester) {
 
 	response, err := atcRequester.httpClient.Do(uploadBits)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "upload request failed:", err)
+		return fmt.Errorf("upload request failed: %s", err.Error())
 	}
 
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
-		fmt.Fprintln(os.Stderr, badResponseError("uploading bits", response))
+		return badResponseError("uploading bits", response)
 	}
+
+	return nil
 }
 
 func download(output Output, atcRequester *atcRequester) {
